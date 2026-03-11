@@ -1,12 +1,15 @@
+version: "3.9"
+
 services:
+
   backend:
     build: ./backend
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - .env                        # GROQ_API_KEY lives here
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data            # SEC benchmark JSONs
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:

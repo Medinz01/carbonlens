@@ -1,8 +1,6 @@
-# CarbonLens v0.1.0 — FastAPI Entry Point
-# Run: uvicorn main:app --reload
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from api.routes import router
 from dotenv import load_dotenv
 
@@ -16,7 +14,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # React dev server
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,3 +25,10 @@ app.include_router(router)
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
+
+@app.get("/health/llm")
+def health_llm():
+    """Check if Groq API is reachable and API key is valid."""
+    from core.extraction.llm_parser import check_groq_health
+    result = check_groq_health()
+    return JSONResponse(content=result, status_code=200 if result["ok"] else 503)
