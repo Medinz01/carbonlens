@@ -1,150 +1,154 @@
+# API Routes for CarbonLens — fully wired
+
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, FileResponse
 from api.schemas import AnalyzeRequest, AnalyzeResponse
-import uuid
-
-# Import Core Engine Modules
-from core.disaggregation.energy_attribution import attribute_energy
-from core.disaggregation.material_attribution import attribute_material
-from core.disaggregation.bayesian_engine import compute_carbon_estimates
-
-# Import Extraction Modules
-from core.extraction.document_handler import handle_upload, merge_extractions
-
-# Import Export Utilities
-from utils.pdf_generator import generate_pdf_report
-from utils.cbam_export import generate_cbam_export
+import uuid, json, os
 
 router = APIRouter()
 
-# Issue #11: Simple in-memory job store
-# Stores analysis results by job_id for later PDF/CBAM export
-JOB_STORE = {}
+# ── In-memory job store (sufficient for hackathon demo) ──────────────────────
+JOB_STORE: dict[str, dict] = {}
 
-@router.post("/analyze", response_model=AnalyzeResponse)
+
+# ── Helper: run full disaggregation pipeline ─────────────────────────────────
+def _run_pipeline(factory_data: dict) -> dict:
+    from core.disaggregation.energy_attribution import attribute_energy
+    from core.disaggregation.material_attribution import attribute_material
+    from core.disaggregation.bayesian_engine import compute_carbon_estimates
+
+    products = factory_data.get("products", [])
+    total_kwh = factory_data.get("energy", {}).get("total_kwh") or 0
+    total_material_kg = sum(
+        m.get("quantity_kg") or 0 for m in factory_data.get("materials", [])
+    )
+
+    energy_results = attribute_energy(total_kwh, products)
+    material_results = attribute_material(total_material_kg, products)
+    carbon_results = compute_carbon_estimates(
+        energy_results, material_results, total_kwh
+    )
+    return {
+        "products": carbon_results,
+        "total_kwh": total_kwh,
+        "total_material_kg": total_material_kg,
+    }
+
+
+# ── POST /analyze — structured JSON input ────────────────────────────────────
+@router.post("/analyze")
 async def analyze(request: AnalyzeRequest):
-    """
-    Issue #9: Main endpoint that takes structured factory data, 
-    runs disaggregation engine, and returns per-product CO2e estimates.
-    """
+    job_id = str(uuid.uuid4())
     try:
-        # Convert Pydantic products to dicts for the core engine
-        products_dict = [p.model_dump() for p in request.products]
-        
-        # 1. Attribute energy (Member 1 module)
-        energy_results = attribute_energy(request.energy.total_kwh, products_dict)
-        
-        # 2. Attribute material (Member 1 module)
-        total_material_kg = sum(m.quantity_kg for m in request.materials)
-        material_results = attribute_material(total_material_kg, products_dict)
-        
-        # 3. Compute Bayesian estimates (Member 1 module)
-        grid_zone = request.factory.grid_zone or "IN_NATIONAL"
-        product_emissions = compute_carbon_estimates(
-            energy_results=energy_results,
-            material_results=material_results,
-            total_kwh=request.energy.total_kwh,
-            grid_zone=grid_zone
-        )
-        
-        # Calculate factory totals
-        factory_total_co2e = sum(p["co2e_estimate"] for p in product_emissions)
-        
-        # Generate Job ID and build response
-        job_id = str(uuid.uuid4())
-        response_data = {
-            "job_id": job_id,
-            "products": product_emissions,
-            "factory_total_co2e": factory_total_co2e,
-            "warnings": []
-        }
-        
-        # Store in memory for exports
-        JOB_STORE[job_id] = {
-            "request": request.model_dump(),
-            "response": response_data
-        }
-        
-        return response_data
-
+        result = _run_pipeline(request.dict())
+        JOB_STORE[job_id] = {"status": "complete", "result": result}
+        return {"job_id": job_id, "status": "complete", **result}
     except Exception as e:
+        JOB_STORE[job_id] = {"status": "error", "error": str(e)}
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── POST /analyze/upload — PDF/CSV document upload ───────────────────────────
 @router.post("/analyze/upload")
 async def analyze_upload(files: list[UploadFile] = File(...)):
-    """
-    Issue #10: Accepts PDF/CSV documents, extracts data via LLM, 
-    merges them, and then runs the analysis pipeline.
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-        
+    from core.extraction.document_handler import handle_upload, merge_extractions
+
+    job_id = str(uuid.uuid4())
+    JOB_STORE[job_id] = {"status": "processing"}
+
     try:
-        extracted_extractions = []
-        
-        # Extract data from each uploaded file
-        for file in files:
-            extracted_data = await handle_upload(file)
-            extracted_extractions.append(extracted_data)
-            
-        # Merge all extractions into a single factory input payload
-        merged_payload = merge_extractions(extracted_extractions)
-        
-        # Validate merged payload against Pydantic schema
-        analyze_request = AnalyzeRequest(**merged_payload)
-        
-        # Pass the validated payload to the standard analyze pipeline
-        return await analyze(analyze_request)
-        
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        extractions = []
+        for f in files:
+            extracted = await handle_upload(f)
+            extractions.append(extracted)
+
+        factory_data = merge_extractions(extractions) if extractions else {}
+
+        # Normalise product fields — fill in missing keys required by pipeline
+        for i, product in enumerate(factory_data.get("products", [])):
+            # id — required by bayesian_engine
+            if "id" not in product:
+                product["id"] = product.get("product_id", f"P{i+1:03d}")
+            # process
+            if "process" not in product:
+                product["process"] = product.get("process_hint", "forging")
+            # material
+            if "material" not in product:
+                product["material"] = "mild_steel"
+            # unit_weight_kg — required for energy attribution
+            if "unit_weight_kg" not in product or not product["unit_weight_kg"]:
+                product["unit_weight_kg"] = 2.0  # conservative default
+            # quantity_units
+            if "quantity_units" not in product or not product["quantity_units"]:
+                product["quantity_units"] = 1
+
+        result = _run_pipeline(factory_data)
+        JOB_STORE[job_id] = {"status": "complete", "result": result, "extracted": factory_data}
+        return {"job_id": job_id, "status": "complete", **result}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process upload: {str(e)}")
+        JOB_STORE[job_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/export/pdf/{job_id}")
-async def export_pdf(job_id: str):
-    """
-    Issue #12: Returns PDF report for a completed analysis job.
-    """
-    if job_id not in JOB_STORE:
-        raise HTTPException(status_code=404, detail="Job ID not found or expired")
-        
-    job_data = JOB_STORE[job_id]
-    
-    # Generate PDF bytes using Member 5's module
-    pdf_bytes = generate_pdf_report(
-        factory=job_data["request"]["factory"],
-        reporting_period=job_data["request"]["reporting_period"],
-        products=job_data["response"]["products"],
-        factory_totals={"total_factory_co2e_estimate": job_data["response"]["factory_total_co2e"]}
-    )
-    
-    # Return as downloadable file response
-    return Response(
-        content=pdf_bytes, 
-        media_type="application/pdf", 
-        headers={"Content-Disposition": f"attachment; filename=CarbonLens_Report_{job_id}.pdf"}
-    )
+# ── GET /jobs/{job_id} — poll job results ────────────────────────────────────
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = JOB_STORE.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return {"job_id": job_id, **job}
 
 
+# ── GET /export/cbam/{job_id} — CBAM JSON download ───────────────────────────
 @router.get("/export/cbam/{job_id}")
 async def export_cbam(job_id: str):
-    """
-    Issue #12: Returns CBAM-formatted JSON export for a completed analysis job.
-    """
-    if job_id not in JOB_STORE:
-        raise HTTPException(status_code=404, detail="Job ID not found or expired")
-        
-    job_data = JOB_STORE[job_id]
-    
-    # Generate CBAM export dictionary using Member 5's module
-    cbam_dict = generate_cbam_export(
-        factory=job_data["request"]["factory"],
-        reporting_period=job_data["request"]["reporting_period"],
-        products=job_data["response"]["products"],
-        factory_totals={"total_factory_co2e_estimate": job_data["response"]["factory_total_co2e"]}
-    )
-    
-    return cbam_dict
+    job = JOB_STORE.get(job_id)
+    if not job or job.get("status") != "complete":
+        raise HTTPException(status_code=404, detail="Job not found or not complete")
+
+    products = job["result"]["products"]
+    cbam_payload = {
+        "schema_version": "CBAM-v1.0",
+        "job_id": job_id,
+        "goods": [
+            {
+                "hs_code": p.get("hs_code", ""),
+                "description": p.get("description", ""),
+                "country_of_origin": "IN",
+                "net_mass_tonnes": p.get("net_mass_tonnes", 0),
+                "embedded_emissions_tco2e": round(p["co2e_estimate"] / 1000, 4),
+                "emissions_intensity_tco2e_per_tonne": p.get("intensity_estimate", 0),
+                "emissions_min_tco2e": round(p["co2e_min"] / 1000, 4),
+                "emissions_max_tco2e": round(p["co2e_max"] / 1000, 4),
+                "confidence_pct": p.get("confidence_pct", 0),
+                "calculation_method": p.get("methodology", "physics_informed_bayesian_disaggregation"),
+                "carbon_price_paid_eur": 0,
+            }
+            for p in products
+        ],
+    }
+    return JSONResponse(content=cbam_payload, headers={
+        "Content-Disposition": f"attachment; filename=cbam_{job_id[:8]}.json"
+    })
+
+
+# ── GET /export/pdf/{job_id} — PDF report download ───────────────────────────
+@router.get("/export/pdf/{job_id}")
+async def export_pdf(job_id: str):
+    job = JOB_STORE.get(job_id)
+    if not job or job.get("status") != "complete":
+        raise HTTPException(status_code=404, detail="Job not found or not complete")
+
+    try:
+        from utils.pdf_generator import generate_pdf
+        from fastapi.responses import Response
+        products = job["result"]["products"]
+        pdf_bytes = generate_pdf(job_id, products)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=carbonlens_{job_id[:8]}.pdf"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")

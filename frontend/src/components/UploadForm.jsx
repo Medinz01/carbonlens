@@ -1,9 +1,11 @@
 import React, { useState, useRef } from 'react';
+import { uploadAndAnalyze } from '../utils/api';
 
 const UploadForm = ({ onUploadSuccess }) => {
   const [files, setFiles] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [error, setError] = useState(null);
   const fileInputRef = useRef(null);
   const acceptedTypes = ['application/pdf', 'text/csv', 'text/plain'];
 
@@ -16,10 +18,11 @@ const UploadForm = ({ onUploadSuccess }) => {
   };
 
   const addFiles = (newFiles) => {
-    const validFiles = newFiles.filter(file => 
+    const validFiles = newFiles.filter(file =>
       acceptedTypes.includes(file.type) || file.name.endsWith('.pdf') || file.name.endsWith('.csv') || file.name.endsWith('.txt')
     );
     setFiles(prev => [...prev, ...validFiles]);
+    setError(null);
   };
 
   const removeFile = (indexToRemove) => setFiles(prev => prev.filter((_, i) => i !== indexToRemove));
@@ -28,15 +31,20 @@ const UploadForm = ({ onUploadSuccess }) => {
     e.preventDefault();
     if (files.length === 0) return;
     setIsUploading(true);
-    setTimeout(() => {
+    setError(null);
+    try {
+      const result = await uploadAndAnalyze(files);
+      onUploadSuccess(result.job_id, result.products || []);
+    } catch (err) {
+      setError(err.message || 'Analysis failed. Please try again.');
+    } finally {
       setIsUploading(false);
-      onUploadSuccess("cbf-node-99x-" + Math.floor(Math.random() * 10000));
-    }, 2500);
+    }
   };
 
   return (
     <div className="w-full max-w-2xl mx-auto p-10 bg-zinc-900/40 backdrop-blur-xl border border-white/5 rounded-3xl shadow-2xl">
-      <div 
+      <div
         className={`relative overflow-hidden border border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all duration-300 ${
           isDragging ? 'border-orange-500/50 bg-orange-500/10 shadow-[inset_0_0_30px_rgba(249,115,22,0.1)]' : 'border-white/20 hover:border-orange-500/40 hover:bg-white/5'
         }`}
@@ -77,16 +85,31 @@ const UploadForm = ({ onUploadSuccess }) => {
         </div>
       )}
 
+      {/* Error message */}
+      {error && (
+        <div className="mt-6 p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-300">
+          ⚠ {error}
+        </div>
+      )}
+
       <button
         onClick={handleSubmit}
         disabled={files.length === 0 || isUploading}
         className={`w-full mt-10 py-4 px-6 rounded-full font-medium tracking-wide transition-all duration-300 flex justify-center items-center ${
-          files.length === 0 || isUploading 
-            ? 'bg-white/5 text-zinc-500 cursor-not-allowed border border-white/5' 
+          files.length === 0 || isUploading
+            ? 'bg-white/5 text-zinc-500 cursor-not-allowed border border-white/5'
             : 'bg-orange-500/10 border border-orange-400/30 backdrop-blur-md text-orange-50 hover:bg-orange-500/30 hover:border-orange-400/60 shadow-[0_0_20px_rgba(249,115,22,0.2)]'
         }`}
       >
-        {isUploading ? 'Processing Telemetry...' : 'Execute Disaggregation'}
+        {isUploading ? (
+          <span className="flex items-center gap-3">
+            <svg className="animate-spin h-4 w-4 text-orange-400" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+            </svg>
+            Processing Telemetry...
+          </span>
+        ) : 'Execute Disaggregation'}
       </button>
     </div>
   );
