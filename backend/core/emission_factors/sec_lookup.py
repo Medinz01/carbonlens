@@ -24,7 +24,11 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Path resolution ──────────────────────────────────────────────────────────
-_BENCHMARK_DIR = Path(__file__).resolve().parents[3] / "data" / "sec_benchmarks"
+_self = Path(__file__).resolve()
+try:
+    _BENCHMARK_DIR = _self.parents[3] / "data" / "sec_benchmarks"
+except IndexError:
+    _BENCHMARK_DIR = _self.parent / "data" / "sec_benchmarks"
 
 # ── Default fallback SEC (conservative MSME estimate) ───────────────────────
 _DEFAULT_SEC = {
@@ -105,6 +109,7 @@ _MATERIAL_ALIASES = {
     "lm25": "aluminium_alloy",
     # cast iron
     "cast iron": "cast_iron_turning",
+    "cast_iron": "grey_iron",          # underscore form was missing — falls through to grey_iron for casting
     "ci": "cast_iron_turning",
     "grey_iron": "grey_iron",
     "gray_iron": "grey_iron",
@@ -116,6 +121,11 @@ _MATERIAL_ALIASES = {
     "bronze": "brass",
     "cu": "brass",
     "copper_alloy": "brass",
+    # machining-specific compound key aliases
+    # machining benchmark keys are compound (e.g. "mild_steel_turning") unlike
+    # other processes which use simple material names. These aliases map a bare
+    # material to the most common machining operation as a default.
+    "brass": "brass_turning",          # fuzzy match fails (ratio too low at 0.6)
     # zinc
     "zinc": "zinc_alloy",
     "zn": "zinc_alloy",
@@ -331,6 +341,22 @@ def get_emission_factor(process: str, material: str) -> float:
         f"in '{process}'. Returning default {_EMISSION_DEFAULT} kgCO2e/kg."
     )
     return _EMISSION_DEFAULT
+
+
+def get_yield_coefficient(process: str, material: str) -> float:
+    """
+    Convenience wrapper used by material_attribution.py.
+    Returns yield_coefficient from the SEC benchmark (0.0–1.0).
+    Falls back to 0.80 (conservative MSME estimate) if not found.
+
+    Args:
+        process: e.g. "forging", "casting", "machining"
+        material: e.g. "mild_steel", "grey_iron"
+
+    Returns:
+        float: yield coefficient (fraction of input material in finished product)
+    """
+    return float(get_sec(process, material).get("yield_coefficient", 0.80))
 
 
 def get_grid_emission_factor(process: str, region: str = "india_national_grid") -> float:
